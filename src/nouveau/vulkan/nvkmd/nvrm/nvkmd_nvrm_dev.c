@@ -27,6 +27,10 @@ nvkmd_nvrm_create_dev(struct nvkmd_pdev *_pdev,
 
    dev->base.ops = &nvkmd_nvrm_dev_ops;
    dev->base.pdev = &pdev->base;
+   /* where RM puts virtual addresses: the extended descriptor buffer views
+    * have to cover it (nvk_edb_bview_cache.c), or none are made */
+   dev->base.va_start = pdev->vaStart;
+   dev->base.va_end = pdev->vaEnd;
 
    simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
 

@@ -395,10 +395,18 @@ nvkmd_nvrm_create_pdev(struct vk_object_base *log_obj,
       NV_CHECK(nvRmApiAlloc(&rm, pdev->hSubdevice, &pdev->hUsermode, usermodeClass, NULL));
       NV_CHECK(nvRmApiMapMemory(&rm, pdev->hSubdevice, pdev->hUsermode, 0, 4096, false, 0, &pdev->usermodeMap));
    }
+   /* Half a terabyte of VA, as nouveau gives: the extended descriptor buffer
+    * views (VK_EXT_descriptor_buffer's texel buffers) cover [va_start,
+    * va_end) with descriptors made up front, two GB apart. RM answers with
+    * the range it set up.
+    */
    NV_VASPACE_ALLOCATION_PARAMETERS vaSpaceParams = {
       .flags = NV_VASPACE_ALLOCATION_FLAGS_RETRY_PTE_ALLOC_IN_SYS,
+      .vaSize = 1ull << 39,
    };
    NV_CHECK(nvRmApiAlloc(&rm, pdev->hDevice, &pdev->hVaSpace, FERMI_VASPACE_A, &vaSpaceParams));
+   pdev->vaStart = vaSpaceParams.vaBase;
+   pdev->vaEnd = vaSpaceParams.vaSize;
 
 
    /* Nouveau uses the OS page size for all pages, regardless of whether they

@@ -36,6 +36,7 @@ struct nvkmd_nvrm_pdev {
    NvHandle hUsermode;
    struct NvRmApiMapping usermodeMap;
    NvHandle hVaSpace;
+   uint64_t vaStart, vaEnd; // the VA space RM set up for hVaSpace
    struct NV2080_CTRL_FB_GET_SEMAPHORE_SURFACE_LAYOUT_PARAMS semSurfLayout;
    uint32_t channelClass;
 
