@@ -3,6 +3,8 @@
 #include <poll.h>
 
 #include "vk_log.h"
+#include "util/os_time.h"
+#include "util/u_atomic.h"
 #include "nvk_device.h"
 #include "nvRmSemSurf.h"
 
@@ -20,6 +22,40 @@ to_nvkmd_nvrm_sync(struct vk_sync *sync)
 {
    assert(vk_sync_type_is_nvkmd_nvrm_sync(sync->type));
    return container_of(sync, struct nvkmd_nvrm_sync, base);
+}
+
+/* Until the GPU signals semaphores itself (NVRM_SYNC_ENABLED), a sync is a
+ * value kept by the processor. Submissions finish before they return
+ * (nvkmd_nvrm_exec_ctx_flush waits for the channel), so a submission's
+ * signals are set once it has run. Other threads read and wait on the value
+ * while it changes, so it is only touched atomically.
+ */
+static bool
+sync_is_signaled(struct nvkmd_nvrm_sync *sync, uint64_t wait_value)
+{
+   uint64_t value = p_atomic_read(&sync->value);
+   if (sync->base.flags & VK_SYNC_IS_TIMELINE)
+      return value >= wait_value;
+   return value != 0;
+}
+
+void
+nvkmd_nvrm_sync_set_signaled(struct vk_sync *_sync, uint64_t value)
+{
+	struct nvkmd_nvrm_sync *sync = to_nvkmd_nvrm_sync(_sync);
+
+   if (!(sync->base.flags & VK_SYNC_IS_TIMELINE)) {
+      p_atomic_set(&sync->value, 1);
+      return;
+   }
+   /* A timeline only moves forward. */
+   uint64_t old = p_atomic_read(&sync->value);
+   while (old < value) {
+      uint64_t seen = p_atomic_cmpxchg(&sync->value, old, value);
+      if (seen == old)
+         break;
+      old = seen;
+   }
 }
 
 static VkResult
@@ -51,6 +87,8 @@ nvkmd_nvrm_sync_init(struct vk_device *_device,
    }
    fprintf(stderr, "}, %" PRIu64 ")\n", initial_value);
 #endif
+
+   p_atomic_set(&sync->value, initial_value);
 
 #if NVRM_SYNC_ENABLED
    VK_CHECK(nvkmd_dev_alloc_mapped_mem(&dev->base, log_obj,  0x1000,  0x1000, NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,  &sync->sem));
@@ -93,6 +131,8 @@ nvkmd_nvrm_sync_signal(struct vk_device *_device,
    fprintf(stderr, "%p.sync_signal(%" PRIu64 ")\n", sync, value);
 #endif
 
+   nvkmd_nvrm_sync_set_signaled(_sync, value);
+
 #if NVRM_SYNC_ENABLED
    uint64_t *semAdr = (uint64_t*)sync->sem->map;
    *semAdr = value;
@@ -118,6 +158,8 @@ nvkmd_nvrm_sync_get_value(struct vk_device *_device,
 #if NVRM_SYNC_ENABLED
    uint64_t *semAdr = (uint64_t*)sync->sem->map;
    *value = *semAdr;
+#else
+   *value = p_atomic_read(&sync->value);
 #endif
 
    return VK_SUCCESS;
@@ -134,6 +176,8 @@ nvkmd_nvrm_sync_reset(struct vk_device *_device,
 #if NVRM_SYNC_DEBUG
    fprintf(stderr, "%p.sync_reset()\n", sync);
 #endif
+
+   p_atomic_set(&sync->value, 0);
 
 #if NVRM_SYNC_ENABLED
    uint64_t *semAdr = (uint64_t*)sync->sem->map;
@@ -152,8 +196,6 @@ nvkmd_nvrm_sync_wait_many(struct vk_device *_device,
 {
    struct nvk_device *vkDev = container_of(_device, struct nvk_device, vk);
    struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(vkDev->nvkmd);
-
-   struct pollfd pollFds[64];
 
 #if NVRM_SYNC_DEBUG
    fprintf(stderr, "sync_wait_many(");
@@ -176,7 +218,21 @@ nvkmd_nvrm_sync_wait_many(struct vk_device *_device,
    fprintf(stderr, "}, %" PRIu64 ")\n", abs_timeout_ns);
 #endif
 
-   return VK_SUCCESS;
+   /* A signal is set when its submission has run, so waiting for one to be
+    * pending is waiting for it to be set. One not set yet belongs to a
+    * submission or a vkSignalSemaphore still to come (another thread). */
+   for (;;) {
+      uint32_t signaled = 0;
+      for (uint32_t i = 0; i < wait_count; i++) {
+         if (sync_is_signaled(to_nvkmd_nvrm_sync(waits[i].sync), waits[i].wait_value))
+            signaled++;
+      }
+      if (signaled == wait_count || (signaled > 0 && (wait_flags & VK_SYNC_WAIT_ANY)))
+         return VK_SUCCESS;
+      if (os_time_get_nano() >= abs_timeout_ns)
+         return VK_TIMEOUT;
+      os_time_sleep(50);
+   }
 }
 
 static VkResult
@@ -214,6 +270,8 @@ nvkmd_nvrm_sync_move(struct vk_device *device,
 #if NVRM_SYNC_ENABLED
    abort();
 #endif
+   p_atomic_set(&dst_sobj->value, p_atomic_read(&src_sobj->value));
+   p_atomic_set(&src_sobj->value, 0);
    return VK_SUCCESS;
 }
 

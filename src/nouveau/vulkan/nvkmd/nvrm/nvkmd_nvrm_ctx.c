@@ -438,7 +438,15 @@ nvkmd_nvrm_exec_ctx_signal(struct nvkmd_ctx *_ctx,
 {
    struct nvkmd_nvrm_exec_ctx *ctx = nvkmd_nvrm_exec_ctx(_ctx);
 
-   return nvkmd_nvrm_exec_ctx_flush(&ctx->base, log_obj);
+   /* The flush returns once the channel has run everything before it. */
+   VkResult result = nvkmd_nvrm_exec_ctx_flush(&ctx->base, log_obj);
+   if (result != VK_SUCCESS)
+      return result;
+
+   for (uint32_t i = 0; i < signal_count; i++)
+      nvkmd_nvrm_sync_set_signaled(signals[i].sync, signals[i].signal_value);
+
+   return VK_SUCCESS;
 }
 
 static VkResult
@@ -527,7 +535,14 @@ nvkmd_nvrm_bind_ctx_signal(struct nvkmd_ctx *_ctx,
 {
    struct nvkmd_nvrm_bind_ctx *ctx = nvkmd_nvrm_bind_ctx(_ctx);
 
-   return nvkmd_nvrm_bind_ctx_flush(&ctx->base, log_obj);
+   VkResult result = nvkmd_nvrm_bind_ctx_flush(&ctx->base, log_obj);
+   if (result != VK_SUCCESS)
+      return result;
+
+   for (uint32_t i = 0; i < signal_count; i++)
+      nvkmd_nvrm_sync_set_signaled(signals[i].sync, signals[i].signal_value);
+
+   return VK_SUCCESS;
 }
 
 const struct nvkmd_ctx_ops nvkmd_nvrm_bind_ctx_ops = {

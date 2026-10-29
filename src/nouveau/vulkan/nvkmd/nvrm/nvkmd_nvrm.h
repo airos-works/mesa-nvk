@@ -190,6 +190,11 @@ vk_sync_as_nvkmd_nvrm_sync(struct vk_sync *sync)
 struct vk_sync_type
 nvkmd_nvrm_sync_get_type(struct nvkmd_nvrm_pdev *pdev);
 
+/* Marks a sync signalled with value (1 for a binary one) once the work that
+ * signals it has run. */
+void
+nvkmd_nvrm_sync_set_signaled(struct vk_sync *sync, uint64_t value);
+
 
 static inline void
 nvkmd_nvrm_dev_api_ctl(struct nvkmd_nvrm_pdev *pdev, struct NvRmApi *rm)
