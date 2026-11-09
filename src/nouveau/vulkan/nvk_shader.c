@@ -314,11 +314,18 @@ lookup_ycbcr_conversion(const void *_state, uint32_t set,
                         uint32_t binding, uint32_t array_index)
 {
    const struct lower_ycbcr_state *state = _state;
-   assert(set < state->set_layout_count);
-   assert(state->set_layouts[set] != NULL);
+   /* A shader can name a binding its set layout does not have: zink's
+    * shaders on Haiku asked for set 0 binding 5 of a 5-binding layout (from
+    * Summit's GPU view transition snapshots). The asserts are gone in release
+    * builds and this read past the binding array and crashed. A binding that
+    * is not in the layout has no immutable samplers, so no YCbCr conversion.
+    */
+   if (set >= state->set_layout_count || state->set_layouts[set] == NULL)
+      return NULL;
    const struct nvk_descriptor_set_layout *set_layout =
       vk_to_nvk_descriptor_set_layout(state->set_layouts[set]);
-   assert(binding < set_layout->binding_count);
+   if (binding >= set_layout->binding_count)
+      return NULL;
 
    const struct nvk_descriptor_set_binding_layout *bind_layout =
       &set_layout->binding[binding];
