@@ -9,6 +9,8 @@
 #include "util/vma.h"
 #include "vk_sync.h"
 #include "nv_push.h"
+#include "util/simple_mtx.h"
+#include "util/u_atomic.h"
 
 #include <sys/types.h>
 
@@ -146,6 +148,8 @@ struct nvkmd_nvrm_exec_ctx {
    uint64_t gpGet;
    uint64_t gpPut;
    struct nv_push push;
+   /* The channel's semaphore is 64-bit (Volta and later). */
+   bool wideSem;
 };
 
 NVKMD_DECL_SUBCLASS(ctx, nvrm_exec);
@@ -163,9 +167,17 @@ VkResult nvkmd_nvrm_create_ctx(struct nvkmd_dev *dev,
 
 struct nvkmd_nvrm_sync {
    struct vk_sync base;
-   struct nvkmd_mem *sem;
-   uint64_t index;
+   simple_mtx_t lock;
+   /* The value it has reached (1 when a binary one is signalled). */
    uint64_t value;
+   /* A signal submitted to a channel and not seen to have run yet: the
+    * channel's semaphore (referenced while pending), whether it is 64-bit,
+    * the sequence number the channel writes to it after that submission,
+    * and the value it then signals. */
+   struct nvkmd_mem *pendingSem;
+   bool pendingWide;
+   uint64_t pendingSeq;
+   uint64_t pendingValue;
 };
 
 void
@@ -194,6 +206,40 @@ nvkmd_nvrm_sync_get_type(struct nvkmd_nvrm_pdev *pdev);
  * signals it has run. */
 void
 nvkmd_nvrm_sync_set_signaled(struct vk_sync *sync, uint64_t value);
+
+/* Notes a signal submitted to the channel whose semaphore is sem: the sync
+ * reaches value once the semaphore reaches seq. */
+void
+nvkmd_nvrm_sync_set_pending(struct vk_sync *sync, struct nvkmd_mem *sem,
+                            bool wide, uint64_t seq, uint64_t value);
+
+/* Whether work submitted after now to the channel whose semaphore is sem
+ * runs after the sync reaches value: it has, or the signal that makes it is
+ * earlier on that channel. */
+bool
+nvkmd_nvrm_sync_ordered_before(struct vk_sync *sync, uint64_t value,
+                               struct nvkmd_mem *sem);
+
+/* Waits on the processor until the sync reaches value. */
+VkResult
+nvkmd_nvrm_sync_cpu_wait(struct vk_sync *sync, uint64_t value);
+
+/* Whether a channel semaphore read as current has reached seq. */
+static inline bool
+nvkmd_nvrm_seq_reached(uint64_t current, uint64_t seq, bool wide)
+{
+   if (wide)
+      return current >= seq;
+   return (int32_t)((uint32_t)current - (uint32_t)seq) >= 0;
+}
+
+static inline uint64_t
+nvkmd_nvrm_sem_read(const struct nvkmd_mem *sem, bool wide)
+{
+   if (wide)
+      return p_atomic_read((uint64_t *)sem->map);
+   return p_atomic_read((uint32_t *)sem->map);
+}
 
 
 static inline void

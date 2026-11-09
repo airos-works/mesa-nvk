@@ -44,6 +44,82 @@
 #define VK_CHECK(vkResIn) {VkResult _vkRes = vkResIn; if (_vkRes != VK_SUCCESS) {vkRes = vk_error(log_obj, _vkRes); goto error;}}
 
 
+#define NVRM_GPFIFO_ENTRIES 0x8000
+/* The release that ends each submission is written into one of these slots
+ * of the context's command buffer (0x10000 bytes). */
+#define NVRM_RELEASE_SLOT_DW 64
+#define NVRM_RELEASE_SLOTS (0x10000 / 4 / NVRM_RELEASE_SLOT_DW)
+
+static KeplerBControlGPFifo *
+exec_ctx_userd(struct nvkmd_nvrm_exec_ctx *ctx)
+{
+   return ctx->hasUserdMap ? (KeplerBControlGPFifo *)ctx->userdMap.address
+                           : ctx->userD->map;
+}
+
+static uint64_t
+exec_ctx_done_seq(struct nvkmd_nvrm_exec_ctx *ctx)
+{
+   return nvkmd_nvrm_sem_read(ctx->sem, ctx->wideSem);
+}
+
+/* Waits for the channel to have run the submission numbered seq. Polled:
+ * resman does not deliver the channel's event on these GPUs. Spin first, as
+ * work often finishes in microseconds, then sleep in short steps. */
+static VkResult
+exec_ctx_wait_seq(struct nvkmd_nvrm_exec_ctx *ctx, uint64_t seq)
+{
+   const int spinLimit = debug_get_num_option("NVK_NVRM_SPIN", 20000);
+   const uint64_t sleep_us = debug_get_num_option("NVK_NVRM_SLEEP_US", 20);
+   /* A channel that hit an error never signals its semaphore, so give up
+    * rather than hanging the application for ever. */
+   const uint64_t timeout_us =
+      debug_get_num_option("NVK_NVRM_TIMEOUT_MS", 10000) * 1000ull;
+   const int64_t waitStart = os_time_get();
+   for (int round = 0;; round++) {
+      uint64_t rSeq = exec_ctx_done_seq(ctx);
+      if (nvkmd_nvrm_seq_reached(rSeq, seq, ctx->wideSem))
+         return VK_SUCCESS;
+      if (round < spinLimit) {
+#if defined(__i386__) || defined(__x86_64__)
+         __builtin_ia32_pause();
+#endif
+         continue;
+      }
+      os_time_sleep(sleep_us);
+      if (timeout_us != 0 && (uint64_t)(os_time_get() - waitStart) > timeout_us) {
+         KeplerBControlGPFifo *userD = exec_ctx_userd(ctx);
+         NvNotification *notifiers = ctx->notifier->map;
+         fprintf(stderr, "nvrm: channel %#x did not finish within %" PRIu64
+            " ms: rSeq %#" PRIx64 ", waiting for %#" PRIx64 ", wSeq %#" PRIx64
+            ", GPGet %" PRIu32 ", GPPut %" PRIu32 ", error notifier %#x\n",
+            (unsigned)ctx->hChannel, timeout_us / 1000, rSeq, seq, ctx->wSeq,
+            userD->GPGet, userD->GPPut,
+            notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR].info32);
+         return VK_ERROR_DEVICE_LOST;
+      }
+   }
+}
+
+/* Waits until the GPFIFO has room for count more entries. */
+static VkResult
+exec_ctx_reserve_gpfifo(struct nvkmd_nvrm_exec_ctx *ctx, uint32_t count)
+{
+   KeplerBControlGPFifo *userD = exec_ctx_userd(ctx);
+   const int64_t waitStart = os_time_get();
+   for (;;) {
+      uint32_t get = p_atomic_read(&userD->GPGet);
+      uint32_t used = (ctx->gpPut + NVRM_GPFIFO_ENTRIES - get) % NVRM_GPFIFO_ENTRIES;
+      if (used + count < NVRM_GPFIFO_ENTRIES - 1)
+         return VK_SUCCESS;
+      if ((uint64_t)(os_time_get() - waitStart) > 10000000ull) {
+         fprintf(stderr, "nvrm: channel %#x GPFIFO stays full\n", (unsigned)ctx->hChannel);
+         return VK_ERROR_DEVICE_LOST;
+      }
+      os_time_sleep(20);
+   }
+}
+
 static void
 write_gp_fifo_entry(struct nvkmd_nvrm_exec_ctx *ctx, const struct nvkmd_ctx_exec *exec)
 {
@@ -56,7 +132,7 @@ write_gp_fifo_entry(struct nvkmd_nvrm_exec_ctx *ctx, const struct nvkmd_ctx_exec
 		DRF_NUM(A16F, _GP_ENTRY1, _LENGTH, (exec->size_B >> 2)) |
 		DRF_NUM(A16F, _GP_ENTRY1, _SYNC, (exec->no_prefetch ? NVA16F_GP_ENTRY1_SYNC_WAIT : NVA16F_GP_ENTRY1_SYNC_PROCEED));
 
-	ctx->gpPut = (ctx->gpPut + 1) % 0x8000;
+	ctx->gpPut = (ctx->gpPut + 1) % NVRM_GPFIFO_ENTRIES;
 }
 
 static void
@@ -252,6 +328,7 @@ nvkmd_nvrm_create_exec_ctx(struct nvkmd_dev *_dev,
 
 
    nv_push_init(&ctx->push, ctx->cmdBuf->map, 0x10000 / 4, BITFIELD_BIT(SUBC_NV9097));
+   ctx->wideSem = pdev->hUsermode != 0;
 
    *ctx_out = &ctx->base;
    return VK_SUCCESS;
@@ -269,6 +346,10 @@ nvkmd_nvrm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
    struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
    struct NvRmApi rm;
    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
+
+   /* Let the channel finish what it was given before it goes. */
+   if (ctx->sem != NULL && ctx->wSeq != 0)
+      exec_ctx_wait_seq(ctx, ctx->wSeq);
 
    nvRmApiFree(&rm, ctx->hEvent);
    if (ctx->osEvent >= 0)
@@ -304,9 +385,22 @@ nvkmd_nvrm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
 {
    struct nvkmd_nvrm_exec_ctx *ctx = nvkmd_nvrm_exec_ctx(_ctx);
 
+   /* The channel runs its work in order, so a signal earlier on it needs
+    * nothing; anything else (another channel, the processor) is waited for
+    * here, before this submission's work is handed over. */
+   for (uint32_t i = 0; i < wait_count; i++) {
+      if (nvkmd_nvrm_sync_ordered_before(waits[i].sync, waits[i].wait_value, ctx->sem))
+         continue;
+      VkResult result = nvkmd_nvrm_sync_cpu_wait(waits[i].sync, waits[i].wait_value);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    return VK_SUCCESS;
 }
 
+/* Ends a submission: the channel writes its sequence number to the
+ * semaphore once everything before has run. Does not wait for that unless
+ * NVK_NVRM_SYNC_SUBMIT=1 (as before, for comparisons). */
 static VkResult
 nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
                              struct vk_object_base *log_obj)
@@ -314,17 +408,25 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
    struct nvkmd_nvrm_exec_ctx *ctx = nvkmd_nvrm_exec_ctx(_ctx);
    struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(ctx->base.dev);
    struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
-   struct NvRmApi rm;
-   nvkmd_nvrm_dev_api_ctl(pdev, &rm);
+   VkResult result;
 
    NvNotification *notifiers = ctx->notifier->map;
    NvNotification *submitTokenNotifier = &notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_WORK_SUBMIT_TOKEN];
-   KeplerBControlGPFifo *userD = ctx->hasUserdMap
-      ? (KeplerBControlGPFifo *)ctx->userdMap.address : ctx->userD->map;
-   uint64_t *semAdr = (uint64_t*)ctx->sem->map;
+   KeplerBControlGPFifo *userD = exec_ctx_userd(ctx);
    uint64_t semAdrGpu = ctx->sem->va->addr;
 
    ctx->wSeq++;
+
+   /* The slot was last used NVRM_RELEASE_SLOTS submissions ago: the channel
+    * has to have read it. */
+   if (ctx->wSeq > NVRM_RELEASE_SLOTS) {
+      result = exec_ctx_wait_seq(ctx, ctx->wSeq - NVRM_RELEASE_SLOTS);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   const uint32_t slot = ctx->wSeq % NVRM_RELEASE_SLOTS;
+   nv_push_init(&ctx->push, (uint32_t *)ctx->cmdBuf->map + slot * NVRM_RELEASE_SLOT_DW,
+                NVRM_RELEASE_SLOT_DW, BITFIELD_BIT(SUBC_NV9097));
 
    bool hasDoorbell = pdev->hUsermode != 0;
    if (hasDoorbell)
@@ -333,12 +435,18 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
       write_semaphore_release_gf100(&ctx->push, semAdrGpu, (uint32_t)ctx->wSeq);
 
    struct nvkmd_ctx_exec semExec = {
-   	.addr = ctx->cmdBuf->va->addr,
+   	.addr = ctx->cmdBuf->va->addr + slot * NVRM_RELEASE_SLOT_DW * 4,
    	.size_B = 4*nv_push_dw_count(&ctx->push),
    };
 
+   result = exec_ctx_reserve_gpfifo(ctx, 1);
+   if (result != VK_SUCCESS)
+      return result;
    write_gp_fifo_entry(ctx, &semExec);
 
+   /* The entries and the pushes they name are written before the channel is
+    * told about them. */
+   __sync_synchronize();
    userD->GPPut = ctx->gpPut;
 
    if (hasDoorbell) {
@@ -346,72 +454,8 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
       *doorbell = submitTokenNotifier->info32;
    }
 
-   /* Wait for the semaphore.  Resman does not deliver the channel's event on
-    * this GPU, so the wait is a poll: spin first, because a submission often
-    * finishes in microseconds, then sleep in short steps.  Sleeping through
-    * poll() costs a whole millisecond per round even when asking for one, so
-    * it is only used once the work has clearly not finished quickly. */
-   const uint64_t target = hasDoorbell ? ctx->wSeq : (uint32_t)ctx->wSeq;
-   const int spinLimit = debug_get_num_option("NVK_NVRM_SPIN", 200000);
-   const uint64_t sleep_us = debug_get_num_option("NVK_NVRM_SLEEP_US", 50);
-   /* A channel that hit an error never signals its semaphore, so give up
-    * rather than hanging the application for ever. */
-   const uint64_t timeout_us =
-      debug_get_num_option("NVK_NVRM_TIMEOUT_MS", 10000) * 1000ull;
-   const int64_t waitStart = os_time_get();
-   for (int round = 0;; round++) {
-      uint64_t rSeq = hasDoorbell ? *semAdr : *(uint32_t*)semAdr;
-      if (rSeq == target) {
-         break;
-      }
-      if (round < spinLimit) {
-#if defined(__i386__) || defined(__x86_64__)
-         __builtin_ia32_pause();
-#endif
-         continue;
-      }
-		int pollRes = 0;
-		if (sleep_us != 0) {
-			os_time_sleep(sleep_us);
-		} else {
-			struct pollfd pollFds[1] = {
-				{
-					.fd = ctx->osEvent,
-					.events = POLLIN|POLLPRI
-				}
-			};
-			pollRes = poll(pollFds, 1, 1);
-		}
-		if (timeout_us != 0 && (uint64_t)(os_time_get() - waitStart) > timeout_us) {
-			fprintf(stderr, "nvrm: channel %#x did not finish within %" PRIu64
-				" ms: rSeq %#" PRIx64 ", wSeq %#" PRIx64 ", GPGet %" PRIu32
-				", GPPut %" PRIu32 ", error notifier %#x\n",
-				(unsigned)ctx->hChannel, timeout_us / 1000, rSeq, ctx->wSeq,
-				userD->GPGet, userD->GPPut,
-				notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR].info32);
-			return VK_ERROR_DEVICE_LOST;
-		}
-		if (getenv("NVK_NVRM_DEBUG") != NULL && (round - spinLimit) % 1000 == 0) {
-			NV906F_CTRL_GET_MMU_FAULT_INFO_PARAMS faultInfo = {0};
-			NV_STATUS faultRes = nvRmApiControl(&rm, ctx->hChannel, NV906F_CTRL_CMD_GET_MMU_FAULT_INFO,
-				&faultInfo, sizeof(faultInfo));
-			NV906F_CTRL_CMD_GET_DEFER_RC_STATE_PARAMS deferRc = {0};
-			NV_STATUS deferRes = nvRmApiControl(&rm, ctx->hChannel, NV906F_CTRL_CMD_GET_DEFER_RC_STATE,
-				&deferRc, sizeof(deferRc));
-			fprintf(stderr, "nvrm channel: fault %#x addr %#x%08x type %#x '%s', deferRc %#x %d, "
-				"error notifier info32 %#x info16 %#x\n", faultRes, faultInfo.addrHi, faultInfo.addrLo,
-				faultInfo.faultType, faultInfo.faultString, deferRes, deferRc.bDeferRCPending,
-				notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR].info32,
-				notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR].info16);
-			fprintf(stderr, "nvrm flush channel %#x: poll %d, rSeq %#" PRIx64 ", wSeq %#" PRIx64
-				", GPGet %" PRIu32 ", GPPut %" PRIu32 ", put %" PRIu64 "\n", (unsigned)ctx->hChannel, pollRes, rSeq,
-				ctx->wSeq, userD->GPGet, userD->GPPut, (uint64_t)ctx->gpPut);
-		}
-   }
-
-   ctx->gpGet = ctx->gpPut;
-   nv_push_init(&ctx->push, ctx->cmdBuf->map, 0x10000 / 4, BITFIELD_BIT(SUBC_NV9097));
-
+   if (debug_get_bool_option("NVK_NVRM_SYNC_SUBMIT", false))
+      return exec_ctx_wait_seq(ctx, ctx->wSeq);
    return VK_SUCCESS;
 }
 
@@ -423,6 +467,10 @@ nvkmd_nvrm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
 {
    struct nvkmd_nvrm_exec_ctx *ctx = nvkmd_nvrm_exec_ctx(_ctx);
 
+   /* With room for the release that ends the submission. */
+   VkResult result = exec_ctx_reserve_gpfifo(ctx, exec_count + 1);
+   if (result != VK_SUCCESS)
+      return result;
    for (uint32_t i = 0; i < exec_count; i++) {
       write_gp_fifo_entry(ctx, &execs[i]);
    }
@@ -438,13 +486,15 @@ nvkmd_nvrm_exec_ctx_signal(struct nvkmd_ctx *_ctx,
 {
    struct nvkmd_nvrm_exec_ctx *ctx = nvkmd_nvrm_exec_ctx(_ctx);
 
-   /* The flush returns once the channel has run everything before it. */
    VkResult result = nvkmd_nvrm_exec_ctx_flush(&ctx->base, log_obj);
    if (result != VK_SUCCESS)
       return result;
 
-   for (uint32_t i = 0; i < signal_count; i++)
-      nvkmd_nvrm_sync_set_signaled(signals[i].sync, signals[i].signal_value);
+   /* The signals happen when the channel reaches this submission. */
+   for (uint32_t i = 0; i < signal_count; i++) {
+      nvkmd_nvrm_sync_set_pending(signals[i].sync, ctx->sem, ctx->wideSem,
+                                  ctx->wSeq, signals[i].signal_value);
+   }
 
    return VK_SUCCESS;
 }
@@ -455,7 +505,10 @@ nvkmd_nvrm_exec_ctx_sync(struct nvkmd_ctx *_ctx,
 {
    struct nvkmd_nvrm_exec_ctx *ctx = nvkmd_nvrm_exec_ctx(_ctx);
 
-   return nvkmd_nvrm_exec_ctx_flush(&ctx->base, log_obj);
+   VkResult result = nvkmd_nvrm_exec_ctx_flush(&ctx->base, log_obj);
+   if (result != VK_SUCCESS)
+      return result;
+   return exec_ctx_wait_seq(ctx, ctx->wSeq);
 }
 
 const struct nvkmd_ctx_ops nvkmd_nvrm_exec_ctx_ops = {
@@ -504,6 +557,12 @@ nvkmd_nvrm_bind_ctx_wait(struct nvkmd_ctx *_ctx,
 {
    struct nvkmd_nvrm_bind_ctx *ctx = nvkmd_nvrm_bind_ctx(_ctx);
 
+   /* Binds happen on the processor, at once. */
+   for (uint32_t i = 0; i < wait_count; i++) {
+      VkResult result = nvkmd_nvrm_sync_cpu_wait(waits[i].sync, waits[i].wait_value);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    return VK_SUCCESS;
 }
 
