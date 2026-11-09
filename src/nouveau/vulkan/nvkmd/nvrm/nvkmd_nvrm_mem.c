@@ -147,7 +147,7 @@ nvkmd_nvrm_alloc_tiled_mem(struct nvkmd_dev *_dev,
 	NvHandle hMemoryPhys = 0;
    NV_STATUS nvRes = nvRmApiAlloc(&rm, pdev->hDevice, &hMemoryPhys, hClass, &params);
    if (nvRes != NV_OK) {
-      fprintf(stderr, "[!] nvRes: %#x\n", nvRes);
+      fprintf(stderr, "[!] nvRes: %#x (mem alloc: size %#" PRIx64 " align %#" PRIx64 " sysmem %d flags %#x)\n", nvRes, (uint64_t)size_B, (uint64_t)align_B, isSystemMem, (unsigned)flags);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
 
@@ -278,7 +278,7 @@ nvkmd_nvrm_mem_map(struct nvkmd_mem *_mem,
 
    NV_STATUS nvRes = nvRmApiMapMemory(&rm, pdev->hSubdevice, mem->hMemoryPhys, 0, mem->base.size_B, mem->isSystemMem, 0, mapping);
    if (nvRes != NV_OK) {
-      fprintf(stderr, "[!] nvRes: %#x\n", nvRes);
+      fprintf(stderr, "[!] nvRes: %#x (mem map: size %#" PRIx64 " sysmem %d)\n", nvRes, (uint64_t)mem->base.size_B, mem->isSystemMem);
       free(mapping);
       return vk_error(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }

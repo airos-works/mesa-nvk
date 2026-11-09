@@ -118,7 +118,13 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
 			params.attr |= DRF_DEF(OS32, _ATTR, _COMPR, _NONE);
 			break;
 		case KIND_S8:
-			params.type = NVOS32_TYPE_STENCIL;
+			/* Resman picks the S8 kind from the attributes (DEPTH_8 with
+			 * ZS_PACKING_S8) for either type, but the Pascal one refuses
+			 * NVOS32_TYPE_STENCIL with NV_ERR_INVALID_ARGUMENT: every
+			 * VK_FORMAT_S8_UINT image failed there, so a GL
+			 * GL_STENCIL_INDEX8 framebuffer through zink was incomplete
+			 * (Summit #197). The Turing heap treats both types alike. */
+			params.type = NVOS32_TYPE_DEPTH;
 			params.attr |= DRF_DEF(OS32, _ATTR, _DEPTH, _8);
 			params.attr |= DRF_DEF(OS32, _ATTR, _FORMAT, _BLOCK_LINEAR);
 			params.attr |= DRF_DEF(OS32, _ATTR, _Z_TYPE, _FIXED);
@@ -164,7 +170,8 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
 
    NV_STATUS nvRes = nvRmApiAlloc(&rm, pdev->hDevice, &hMemoryVirt, NV50_MEMORY_VIRTUAL, &params);
    if (nvRes != NV_OK) {
-      fprintf(stderr, "[!] nvRes: %#x\n", nvRes);
+      fprintf(stderr, "[!] nvRes: %#x (VA alloc: size %#" PRIx64 " align %#" PRIx64 " kind %#x type %u flags %#x attr %#x attr2 %#x fixed %#" PRIx64 " vaflags %#x)\n",
+         nvRes, (uint64_t)size_B, (uint64_t)align_B, pte_kind, params.type, params.flags, params.attr, params.attr2, (uint64_t)fixed_addr, (unsigned)flags);
    	nvkmd_va_free(&va->base);
       return VK_ERROR_UNKNOWN;
    }
@@ -222,7 +229,7 @@ nvkmd_nvrm_va_bind_mem(struct nvkmd_va *_va,
    NvU64 dmaOffset = va_offset_B;
    NV_STATUS nvRes = nvRmApiMapMemoryDma(&rm, pdev->hDevice, va->hMemoryVirt, mem->hMemoryPhys, mem_offset_B, range_B, gpuMapFlags, &dmaOffset);
    if (nvRes != NV_OK) {
-      fprintf(stderr, "[!] nvRes: %#x\n", nvRes);
+      fprintf(stderr, "[!] nvRes: %#x (VA bind: va %#" PRIx64 "+%#" PRIx64 " mem off %#" PRIx64 " range %#" PRIx64 " sysmem %d)\n", nvRes, va->base.addr, va_offset_B, mem_offset_B, range_B, mem->isSystemMem);
       return VK_ERROR_UNKNOWN;
    }
    if (dmaOffset != va->base.addr + va_offset_B) {
