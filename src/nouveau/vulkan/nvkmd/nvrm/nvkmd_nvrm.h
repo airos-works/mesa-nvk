@@ -9,6 +9,9 @@
 #include "util/vma.h"
 #include "vk_sync.h"
 #include "nv_push.h"
+#include "util/simple_mtx.h"
+#include "util/u_atomic.h"
+#include "util/u_dynarray.h"
 
 #include <sys/types.h>
 
@@ -146,6 +149,12 @@ struct nvkmd_nvrm_exec_ctx {
    uint64_t gpGet;
    uint64_t gpPut;
    struct nv_push push;
+   /* The channel's semaphore is 64-bit (Volta and later). */
+   bool wideSem;
+   /* Settings read once when the context is made. */
+   bool semWfi;        /* the release waits for idle (NVK_NVRM_NO_SEM_WFI) */
+   bool syncSubmit;    /* every flush waits for the GPU (NVK_NVRM_SYNC_SUBMIT) */
+   uint64_t timeoutNs; /* a wait longer than this means the channel is dead */
 };
 
 NVKMD_DECL_SUBCLASS(ctx, nvrm_exec);
@@ -161,11 +170,24 @@ VkResult nvkmd_nvrm_create_ctx(struct nvkmd_dev *dev,
                                   enum nvkmd_engines engines,
                                   struct nvkmd_ctx **ctx_out);
 
+/* A signal submitted to a channel and not seen to have run yet: the sync
+ * reaches value once the channel's semaphore (referenced while the point
+ * lives) reaches seq. */
+struct nvkmd_nvrm_sync_point {
+   struct nvkmd_mem *sem;
+   uint64_t seq;
+   uint64_t value;
+   bool wide;
+};
+
 struct nvkmd_nvrm_sync {
    struct vk_sync base;
-   struct nvkmd_mem *sem;
-   uint64_t index;
+   simple_mtx_t lock;
+   /* The value it has reached (1 when a binary one is signalled). */
    uint64_t value;
+   /* struct nvkmd_nvrm_sync_point, in the order they were submitted (and so
+    * by increasing value on a timeline). A binary sync has at most one. */
+   struct util_dynarray points;
 };
 
 void
@@ -194,6 +216,50 @@ nvkmd_nvrm_sync_get_type(struct nvkmd_nvrm_pdev *pdev);
  * signals it has run. */
 void
 nvkmd_nvrm_sync_set_signaled(struct vk_sync *sync, uint64_t value);
+
+/* Notes a signal submitted to the channel whose semaphore is sem: the sync
+ * reaches value once the semaphore reaches seq. */
+void
+nvkmd_nvrm_sync_set_pending(struct vk_sync *sync, struct nvkmd_mem *sem,
+                            bool wide, uint64_t seq, uint64_t value);
+
+/* Whether work submitted after now to the channel whose semaphore is sem
+ * runs after the sync reaches value: it has, or the signal that makes it is
+ * earlier on that channel. Otherwise, with a point to wait for, *point_out is
+ * set to it (holding a reference to its semaphore, for the caller to drop). */
+bool
+nvkmd_nvrm_sync_ordered_before(struct vk_sync *sync, uint64_t value,
+                               struct nvkmd_mem *sem,
+                               struct nvkmd_nvrm_sync_point *point_out);
+
+/* Waits on the processor until the sync reaches value. */
+VkResult
+nvkmd_nvrm_sync_cpu_wait(struct vk_sync *sync, uint64_t value);
+
+/* Whether a channel semaphore read as current has reached seq. */
+static inline bool
+nvkmd_nvrm_seq_reached(uint64_t current, uint64_t seq, bool wide)
+{
+   if (wide)
+      return current >= seq;
+   return (int32_t)((uint32_t)current - (uint32_t)seq) >= 0;
+}
+
+/* One step of a polled wait that began at start_ns (os_time_get_nano()):
+ * spins for the first few microseconds, as most waits end within them, then
+ * sleeps in steps that grow with the time already waited. Resman does not
+ * deliver the channels' completion events on the GPUs this runs on, so
+ * every wait for the GPU is a poll. */
+void
+nvkmd_nvrm_poll_step(int64_t start_ns);
+
+static inline uint64_t
+nvkmd_nvrm_sem_read(const struct nvkmd_mem *sem, bool wide)
+{
+   if (wide)
+      return p_atomic_read((uint64_t *)sem->map);
+   return p_atomic_read((uint32_t *)sem->map);
+}
 
 
 static inline void
