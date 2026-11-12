@@ -50,6 +50,7 @@
 #include "os_misc.h"
 #include <sys/stat.h>
 #include <stdio.h>
+#include <string.h>
 #endif
 
 #if !(defined(__FreeBSD__) || defined(HAVE_MKOSTEMP) || DETECT_OS_ANDROID)
