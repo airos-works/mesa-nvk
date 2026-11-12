@@ -173,8 +173,17 @@ loader_wayland_dispatch(struct wl_display *wl_display,
 
    MESA_TRACE_FUNC();
 
-   if (!end_time)
+   if (!end_time) {
+#ifdef __HAIKU__
+      /* Haiku's in-process libwayland-client does not wait in
+       * wl_display_dispatch_queue(): it dispatches what is queued and
+       * returns, so a caller waiting for an event in a loop spins a core
+       * until it comes. This one waits on the display's descriptor. */
+      return wl_display_dispatch_queue_timeout(wl_display, queue, NULL);
+#else
       return wl_display_dispatch_queue(wl_display, queue);
+#endif
+   }
 
    clock_gettime(CLOCK_MONOTONIC, &current_time);
    timespec_sub_saturate(&remaining_timeout, end_time, &current_time);

@@ -1560,7 +1560,12 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 #endif
       }
 
-      if (wsi->sw)
+      /* An image that reaches the presentation engine through the CPU - a
+       * software driver's, or a hardware driver's blitted into host memory
+       * for wl_shm (cpu_map) - is read as soon as queue_present runs, so
+       * the GPU must have finished it (haiku#111).
+       */
+      if (wsi->sw || image->cpu_map != NULL)
          wsi->WaitForFences(device, 1, &swapchain->fences[image_index], true, ~0ull);
 
       const VkPresentRegionKHR *region = NULL;
@@ -2322,9 +2327,13 @@ wsi_configure_cpu_image(const struct wsi_swapchain *chain,
       return result;
 
    if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
+      /* A hardware driver imports the buffer the GPU blits into from host
+       * memory in whole pages (minImportedHostPointerAlignment). */
+      const uint32_t size_align =
+         params->alloc_shm && !chain->wsi->sw ? 4096 : 1;
       wsi_configure_buffer_image(chain, pCreateInfo,
                                  1 /* stride_align */,
-                                 1 /* size_align */,
+                                 size_align,
                                  info);
 
       info->select_blit_dst_memory_type = wsi_select_host_memory_type;
