@@ -340,15 +340,23 @@ nvkmd_nvrm_create_pdev(struct vk_object_base *log_obj,
 	}
 
 	NV2080_CTRL_FB_GET_INFO_V2_PARAMS fbGetInfoParams = {
-		.fbInfoListSize = 2,
+		.fbInfoListSize = 3,
 		.fbInfoList = {
 			{.index = NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE},
 			{.index = NV2080_CTRL_FB_INFO_INDEX_BAR1_SIZE},
+			{.index = NV2080_CTRL_FB_INFO_INDEX_BAR1_AVAIL_SIZE},
 		},
 	};
    NV_CHECK(nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_FB_GET_INFO_V2, &fbGetInfoParams, sizeof(fbGetInfoParams)));
 	uint64_t vramSize = fbGetInfoParams.fbInfoList[0].data * (uint64_t)1024;
 	uint64_t bar1Size = fbGetInfoParams.fbInfoList[1].data * (uint64_t)1024;
+	/* The BAR heap's memory is mapped through BAR1, which the frame buffer,
+	 * the channels and other processes share: offer what is left of it,
+	 * less what nvkmd_nvrm_mem.c keeps free for others. */
+	uint64_t bar1Avail = fbGetInfoParams.fbInfoList[2].data * (uint64_t)1024;
+	const uint64_t bar1Reserve = 32ull * 1024 * 1024;
+	if (bar1Avail < bar1Size)
+		bar1Size = bar1Avail > 2 * bar1Reserve ? bar1Avail - bar1Reserve : 0;
 
    pdev->base.dev_info = (struct nv_device_info) {
     .type = NV_DEVICE_TYPE_DIS,

@@ -6,6 +6,7 @@
 #include "nvkmd_nvrm.h"
 
 #include <inttypes.h>
+#include <stdlib.h>
 
 #include "util/u_atomic.h"
 
@@ -21,6 +22,43 @@
 #include "class/cl003e.h" // NV01_MEMORY_SYSTEM
 #include "class/cl0040.h" // NV01_MEMORY_LOCAL_USER
 
+
+
+/* Bytes of BAR1 to leave for others: the accelerant's frame buffer mappings,
+ * channels and other processes map through the same window. */
+#define NVKMD_NVRM_BAR1_RESERVE_B (32ull * 1024 * 1024)
+
+static bool
+nvkmd_nvrm_bar1_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *env = getenv("NVK_NVRM_BAR1");
+      p_atomic_set(&enabled, env == NULL || atoi(env) != 0);
+   }
+   return enabled;
+}
+
+static bool
+nvkmd_nvrm_bar1_has_room(struct nvkmd_nvrm_pdev *pdev, struct NvRmApi *rm,
+                         uint64_t size_B)
+{
+   if (!nvkmd_nvrm_bar1_enabled())
+      return false;
+
+   NV2080_CTRL_FB_GET_INFO_V2_PARAMS info = {
+      .fbInfoListSize = 1,
+      .fbInfoList = {
+         {.index = NV2080_CTRL_FB_INFO_INDEX_BAR1_AVAIL_SIZE},
+      },
+   };
+   if (nvRmApiControl(rm, pdev->hSubdevice, NV2080_CTRL_CMD_FB_GET_INFO_V2,
+                      &info, sizeof(info)) != NV_OK)
+      return false;
+
+   const uint64_t avail_B = info.fbInfoList[0].data * (uint64_t)1024;
+   return avail_B >= size_B + NVKMD_NVRM_BAR1_RESERVE_B;
+}
 
 static VkResult
 create_mem_or_close_bo(struct nvkmd_nvrm_dev *dev,
@@ -109,9 +147,24 @@ nvkmd_nvrm_alloc_tiled_mem(struct nvkmd_dev *_dev,
       flags &= ~(NVKMD_MEM_LOCAL | NVKMD_MEM_VRAM);
       flags |= NVKMD_MEM_GART;
    }
+   /* Memory the processor maps used to become system memory whatever was
+    * asked for, so the "video memory the processor can write" type and NVK's
+    * own mapped tables (descriptors, events) were really in system memory and
+    * every GPU access to them crossed the bus (airos-works/haiku#108). Video
+    * memory can be mapped through BAR1 instead, write-combined, as long as
+    * BAR1 has room; it is shared by every process, so check what is left.
+    */
+   bool bar1 = false;
    if (flags & NVKMD_MEM_CAN_MAP) {
-      flags &= ~(NVKMD_MEM_LOCAL | NVKMD_MEM_VRAM);
-      flags |= NVKMD_MEM_GART;
+      if ((flags & (NVKMD_MEM_LOCAL | NVKMD_MEM_VRAM)) &&
+          !(flags & NVKMD_MEM_SHARED) &&
+          nvkmd_nvrm_bar1_has_room(pdev, &rm, align64(size_B, 64 * 1024))) {
+         bar1 = true;
+         flags &= ~NVKMD_MEM_GART;
+      } else {
+         flags &= ~(NVKMD_MEM_LOCAL | NVKMD_MEM_VRAM);
+         flags |= NVKMD_MEM_GART;
+      }
    }
 
    const uint32_t mem_align_B = _dev->pdev->bind_align_B;
@@ -123,7 +176,7 @@ nvkmd_nvrm_alloc_tiled_mem(struct nvkmd_dev *_dev,
    enum nvkmd_va_flags va_flags = NVKMD_VA_GART;
 
 	bool isSystemMem = (flags & NVKMD_MEM_GART) != 0;
-	const NvU32 hClass = isSystemMem ?
+	NvU32 hClass = isSystemMem ?
 		NV01_MEMORY_SYSTEM :
 		NV01_MEMORY_LOCAL_USER;
 
@@ -140,12 +193,28 @@ nvkmd_nvrm_alloc_tiled_mem(struct nvkmd_dev *_dev,
 		params.attr |= DRF_DEF(OS32, _ATTR, _COHERENCY, _CACHED);
 	} else {
 		params.attr |= DRF_DEF(OS32, _ATTR, _LOCATION, _VIDMEM);
-		params.attr |= DRF_DEF(OS32, _ATTR, _COHERENCY, _UNCACHED);
+		if (bar1)
+			params.attr |= DRF_DEF(OS32, _ATTR, _COHERENCY, _WRITE_COMBINE);
+		else
+			params.attr |= DRF_DEF(OS32, _ATTR, _COHERENCY, _UNCACHED);
 		params.flags |= NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
 	}
 
 	NvHandle hMemoryPhys = 0;
    NV_STATUS nvRes = nvRmApiAlloc(&rm, pdev->hDevice, &hMemoryPhys, hClass, &params);
+   if (nvRes != NV_OK && bar1) {
+      /* Video memory is full: system memory still works, only slower. */
+      flags &= ~(NVKMD_MEM_LOCAL | NVKMD_MEM_VRAM);
+      flags |= NVKMD_MEM_GART;
+      isSystemMem = true;
+      hClass = NV01_MEMORY_SYSTEM;
+      params.attr = DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _4KB) |
+                    DRF_DEF(OS32, _ATTR, _LOCATION, _PCI) |
+                    DRF_DEF(OS32, _ATTR, _COHERENCY, _CACHED);
+      params.flags &= ~NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
+      hMemoryPhys = 0;
+      nvRes = nvRmApiAlloc(&rm, pdev->hDevice, &hMemoryPhys, hClass, &params);
+   }
    if (nvRes != NV_OK) {
       fprintf(stderr, "[!] nvRes: %#x (mem alloc: size %#" PRIx64 " align %#" PRIx64 " sysmem %d flags %#x)\n", nvRes, (uint64_t)size_B, (uint64_t)align_B, isSystemMem, (unsigned)flags);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
