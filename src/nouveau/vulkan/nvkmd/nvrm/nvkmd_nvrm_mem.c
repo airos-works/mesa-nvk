@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "util/os_time.h"
 #include "util/u_atomic.h"
 
 #include "vk_log.h"
@@ -30,6 +31,124 @@
 #define NVKMD_NVRM_BAR1_RESERVE_B (32ull * 1024 * 1024)
 
 #define NVKMD_NVRM_DEFAULT_MAX_PAGE_B (2u << 20)
+
+/* The free-memory cache: system memory up to this size per allocation, this
+ * much in all, for this long after it was freed. RM's allocation of system
+ * memory, its GPU range, GPU mapping and CPU mapping cost 100-300 us, and
+ * freeing them another 70-110 us, most of it page table and TLB work in RM
+ * (airos-works/haiku#132); reuse costs the clearing of the memory. */
+#define NVKMD_NVRM_CACHE_ENTRY_MAX_B (4u << 20)
+#define NVKMD_NVRM_CACHE_MAX_B (32u << 20)
+#define NVKMD_NVRM_CACHE_AGE_NS (2000ll * 1000 * 1000)
+
+static void nvkmd_nvrm_mem_release(struct nvkmd_nvrm_mem *mem);
+
+static bool
+nvkmd_nvrm_mem_cache_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *env = getenv("NVK_NVRM_MEM_CACHE");
+      p_atomic_set(&enabled, env == NULL || atoi(env) != 0);
+   }
+   return enabled;
+}
+
+/* Takes what has been cached too long, or what exceeds the budget, out of the
+ * cache into \a evicted. Called with dev->mutex held. */
+static void
+mem_cache_evict_locked(struct nvkmd_nvrm_dev *dev, int64_t now_ns,
+                       uint64_t budget_B, struct list_head *evicted)
+{
+   list_for_each_entry_safe(struct nvkmd_nvrm_mem, mem, &dev->memCache,
+                            cacheLink) {
+      if (dev->memCacheBytes <= budget_B &&
+          now_ns - mem->freedAt_ns < NVKMD_NVRM_CACHE_AGE_NS)
+         break;
+      list_del(&mem->cacheLink);
+      dev->memCacheBytes -= mem->base.size_B;
+      list_addtail(&mem->cacheLink, evicted);
+   }
+}
+
+static void
+mem_cache_release(struct list_head *evicted)
+{
+   list_for_each_entry_safe(struct nvkmd_nvrm_mem, mem, evicted, cacheLink)
+      nvkmd_nvrm_mem_release(mem);
+}
+
+void
+nvkmd_nvrm_mem_cache_drain(struct nvkmd_nvrm_dev *dev)
+{
+   struct list_head evicted;
+   list_inithead(&evicted);
+   simple_mtx_lock(&dev->mutex);
+   mem_cache_evict_locked(dev, INT64_MAX / 2, 0, &evicted);
+   simple_mtx_unlock(&dev->mutex);
+   mem_cache_release(&evicted);
+}
+
+/* Memory of exactly this size and kind from the cache, cleared, or NULL. */
+static struct nvkmd_nvrm_mem *
+mem_cache_take(struct nvkmd_nvrm_dev *dev, uint64_t size_B,
+               enum nvkmd_mem_flags flags, uint64_t va_align_B)
+{
+   struct nvkmd_nvrm_mem *found = NULL;
+   struct list_head evicted;
+   list_inithead(&evicted);
+
+   simple_mtx_lock(&dev->mutex);
+   mem_cache_evict_locked(dev, os_time_get_nano(), NVKMD_NVRM_CACHE_MAX_B,
+                          &evicted);
+   list_for_each_entry_rev(struct nvkmd_nvrm_mem, mem, &dev->memCache,
+                           cacheLink) {
+      if (mem->base.size_B == size_B && mem->base.flags == flags &&
+          (mem->base.va->addr & (va_align_B - 1)) == 0) {
+         list_del(&mem->cacheLink);
+         dev->memCacheBytes -= size_B;
+         found = mem;
+         break;
+      }
+   }
+   simple_mtx_unlock(&dev->mutex);
+   mem_cache_release(&evicted);
+
+   if (found == NULL)
+      return NULL;
+
+   /* New memory from RM is cleared; so is this. */
+   memset(found->idleMapping->address, 0, size_B);
+
+   struct nvkmd_va *va = found->base.va;
+   nvkmd_mem_init(&dev->base, &found->base, &nvkmd_nvrm_mem_ops, flags, size_B,
+                  dev->base.pdev->bind_align_B);
+   found->base.va = va;
+   return found;
+}
+
+/* Keeps freed memory for reuse; false if it does not qualify. */
+static bool
+mem_cache_put(struct nvkmd_nvrm_dev *dev, struct nvkmd_nvrm_mem *mem)
+{
+   if (!mem->cacheable || mem->idleMapping == NULL ||
+       mem->base.size_B > NVKMD_NVRM_CACHE_ENTRY_MAX_B ||
+       !nvkmd_nvrm_mem_cache_enabled())
+      return false;
+
+   struct list_head evicted;
+   list_inithead(&evicted);
+
+   const int64_t now_ns = os_time_get_nano();
+   mem->freedAt_ns = now_ns;
+   simple_mtx_lock(&dev->mutex);
+   list_addtail(&mem->cacheLink, &dev->memCache);
+   dev->memCacheBytes += mem->base.size_B;
+   mem_cache_evict_locked(dev, now_ns, NVKMD_NVRM_CACHE_MAX_B, &evicted);
+   simple_mtx_unlock(&dev->mutex);
+   mem_cache_release(&evicted);
+   return true;
+}
 
 static bool
 nvkmd_nvrm_bar1_enabled(void)
@@ -270,8 +389,19 @@ nvkmd_nvrm_alloc_tiled_mem(struct nvkmd_dev *_dev,
 		params.flags |= NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
 	}
 
+	if (isSystemMem && pte_kind == 0 && tile_mode == 0 &&
+	    !(flags & NVKMD_MEM_SHARED) && nvkmd_nvrm_mem_cache_enabled()) {
+		struct nvkmd_nvrm_mem *cached =
+			mem_cache_take(dev, size_B, flags, va_align_B);
+		if (cached != NULL) {
+			*mem_out = &cached->base;
+			return VK_SUCCESS;
+		}
+	}
+
 	/* RM writes back into the parameters, so a retry starts from a copy. */
 	const NV_MEMORY_ALLOCATION_PARAMS params0 = params;
+	NV_MEMORY_ALLOCATION_PARAMS paramsLast = params;
 	NvHandle hMemoryPhys = 0;
    NV_STATUS nvRes = nvRmApiAlloc(&rm, pdev->hDevice, &hMemoryPhys, hClass, &params);
    while (nvRes != NV_OK && pageSize_B > 4096) {
@@ -305,6 +435,15 @@ nvkmd_nvrm_alloc_tiled_mem(struct nvkmd_dev *_dev,
       params.size = size_B;
       params.alignment = align_B;
       pageSize_B = 4096;
+      paramsLast = params;
+      hMemoryPhys = 0;
+      nvRes = nvRmApiAlloc(&rm, pdev->hDevice, &hMemoryPhys, hClass, &params);
+   }
+   if (nvRes != NV_OK && isSystemMem && !list_is_empty(&dev->memCache)) {
+      /* What the cache holds counts against the floor of free memory that
+       * nvidia_rm keeps for the rest of the system (airos-works/haiku#105). */
+      nvkmd_nvrm_mem_cache_drain(dev);
+      params = paramsLast;
       hMemoryPhys = 0;
       nvRes = nvRmApiAlloc(&rm, pdev->hDevice, &hMemoryPhys, hClass, &params);
    }
@@ -313,9 +452,14 @@ nvkmd_nvrm_alloc_tiled_mem(struct nvkmd_dev *_dev,
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
 
-   return create_mem_or_close_bo(dev, log_obj, flags, hMemoryPhys, size_B,
-                                 va_flags, pte_kind, va_align_B, pageSize_B,
-                                 mem_out);
+   VkResult result =
+      create_mem_or_close_bo(dev, log_obj, flags, hMemoryPhys, size_B,
+                             va_flags, pte_kind, va_align_B, pageSize_B,
+                             mem_out);
+   if (result == VK_SUCCESS && isSystemMem && pte_kind == 0 &&
+       tile_mode == 0 && !(flags & NVKMD_MEM_SHARED))
+      nvkmd_nvrm_mem(*mem_out)->cacheable = true;
+   return result;
 }
 
 // Wrap memory the application already owns in a resman memory object, so the
@@ -407,19 +551,34 @@ nvkmd_nvrm_import_dma_buf(struct nvkmd_dev *_dev,
    return vk_errorf(log_obj, VK_ERROR_UNKNOWN, "nvkmd_nvrm_import_dma_buf: not implemented");
 }
 
+/* Gives the memory back to RM. */
 static void
-nvkmd_nvrm_mem_free(struct nvkmd_mem *_mem)
+nvkmd_nvrm_mem_release(struct nvkmd_nvrm_mem *mem)
 {
-   struct nvkmd_nvrm_mem *mem = nvkmd_nvrm_mem(_mem);
    struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(mem->base.dev);
    struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
 
    struct NvRmApi rm;
    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
 
+   if (mem->idleMapping != NULL) {
+      nvRmApiUnmapMemory(&rm, pdev->hSubdevice, mem->hMemoryPhys, 0,
+                         mem->idleMapping);
+      free(mem->idleMapping);
+   }
    nvkmd_va_free(mem->base.va);
    nvRmApiFree(&rm, mem->hMemoryPhys);
    FREE(mem);
+}
+
+static void
+nvkmd_nvrm_mem_free(struct nvkmd_mem *_mem)
+{
+   struct nvkmd_nvrm_mem *mem = nvkmd_nvrm_mem(_mem);
+   struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(mem->base.dev);
+
+   if (!mem_cache_put(dev, mem))
+      nvkmd_nvrm_mem_release(mem);
 }
 
 static VkResult
@@ -436,18 +595,33 @@ nvkmd_nvrm_mem_map(struct nvkmd_mem *_mem,
    struct NvRmApi rm;
    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
 
-   NvRmApiMapping *mapping = CALLOC_STRUCT(NvRmApiMapping);
-   if (mapping == NULL)
-      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   NV_STATUS nvRes = nvRmApiMapMemory(&rm, pdev->hSubdevice, mem->hMemoryPhys, 0, mem->base.size_B, mem->isSystemMem, 0, mapping);
-   if (nvRes != NV_OK) {
-      fprintf(stderr, "[!] nvRes: %#x (mem map: size %#" PRIx64 " sysmem %d)\n", nvRes, (uint64_t)mem->base.size_B, mem->isSystemMem);
-      free(mapping);
-      return vk_error(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   /* The mapping kept from the last unmap, if there is one. */
+   NvRmApiMapping *mapping = NULL;
+   if (!(map_flags & NVKMD_MEM_MAP_FIXED)) {
+      simple_mtx_lock(&dev->mutex);
+      mapping = mem->idleMapping;
+      mem->idleMapping = NULL;
+      simple_mtx_unlock(&dev->mutex);
    }
 
-   if (_mesa_hash_table_insert(dev->mappings, mapping->address, mapping) == NULL) {
+   if (mapping == NULL) {
+      mapping = CALLOC_STRUCT(NvRmApiMapping);
+      if (mapping == NULL)
+         return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+      NV_STATUS nvRes = nvRmApiMapMemory(&rm, pdev->hSubdevice, mem->hMemoryPhys, 0, mem->base.size_B, mem->isSystemMem, 0, mapping);
+      if (nvRes != NV_OK) {
+         fprintf(stderr, "[!] nvRes: %#x (mem map: size %#" PRIx64 " sysmem %d)\n", nvRes, (uint64_t)mem->base.size_B, mem->isSystemMem);
+         free(mapping);
+         return vk_error(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+   }
+
+   simple_mtx_lock(&dev->mutex);
+   struct hash_entry *entry =
+      _mesa_hash_table_insert(dev->mappings, mapping->address, mapping);
+   simple_mtx_unlock(&dev->mutex);
+   if (entry == NULL) {
    	nvRmApiUnmapMemory(&rm, pdev->hSubdevice, mem->hMemoryPhys, 0, mapping);
       free(mapping);
       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -469,12 +643,24 @@ nvkmd_nvrm_mem_unmap(struct nvkmd_mem *_mem,
    struct NvRmApi rm;
    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
 
+   simple_mtx_lock(&dev->mutex);
    struct hash_entry *ent = _mesa_hash_table_search(dev->mappings, map);
-   if (ent == NULL) {
+   NvRmApiMapping *mapping = ent != NULL ? ent->data : NULL;
+   if (ent != NULL)
+      _mesa_hash_table_remove(dev->mappings, ent);
+   /* Cacheable memory keeps one mapping for the next map, and for clearing
+    * the memory should it be reused (mem_cache_take()). */
+   const bool keep = mapping != NULL && mem->cacheable &&
+                     mem->idleMapping == NULL;
+   if (keep)
+      mem->idleMapping = mapping;
+   simple_mtx_unlock(&dev->mutex);
+   if (mapping == NULL) {
       fprintf(stderr, "[!] ent == NULL\n");
       return;
    }
-   NvRmApiMapping *mapping = ent->data;
+   if (keep)
+      return;
 
    NV_STATUS nvRes = nvRmApiUnmapMemory(&rm, pdev->hSubdevice, mem->hMemoryPhys, 0, mapping);
    if (nvRes != NV_OK) {

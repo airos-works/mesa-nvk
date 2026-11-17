@@ -56,8 +56,16 @@ VkResult nvkmd_nvrm_try_create_pdev(struct _drmDevice *drm_device,
 
 struct nvkmd_nvrm_dev {
    struct nvkmd_dev base;
+   /* Guards mappings and the free-memory cache. */
+   simple_mtx_t mutex;
    struct hash_table *mappings;
+   /* System memory freed recently, kept for reuse with its GPU range, GPU
+    * mapping and CPU mapping (nvkmd_nvrm_mem.c); oldest first. */
+   struct list_head memCache;
+   uint64_t memCacheBytes;
 };
+
+void nvkmd_nvrm_mem_cache_drain(struct nvkmd_nvrm_dev *dev);
 
 NVKMD_DECL_SUBCLASS(dev, nvrm);
 
@@ -81,6 +89,15 @@ struct nvkmd_nvrm_mem {
     * 2 MiB (huge). A bind that is not aligned to it is mapped with smaller
     * pages (nvkmd_nvrm_va.c). */
    uint32_t pageSize_B;
+   /* System memory nvkmd allocated itself (not an import), which can go to
+    * the free-memory cache once it has a CPU mapping. */
+   bool cacheable;
+   /* The CPU mapping kept after the last unmap of cacheable memory, ready
+    * for the next map or for clearing the memory when it is reused. */
+   struct NvRmApiMapping *idleMapping;
+   /* in dev->memCache while freed */
+   struct list_head cacheLink;
+   int64_t freedAt_ns;
 };
 
 NVKMD_DECL_SUBCLASS(mem, nvrm);
