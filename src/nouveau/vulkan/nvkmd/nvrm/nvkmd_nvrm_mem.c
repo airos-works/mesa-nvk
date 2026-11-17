@@ -7,6 +7,7 @@
 
 #include <inttypes.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "util/u_atomic.h"
 
@@ -27,6 +28,8 @@
 /* Bytes of BAR1 to leave for others: the accelerant's frame buffer mappings,
  * channels and other processes map through the same window. */
 #define NVKMD_NVRM_BAR1_RESERVE_B (32ull * 1024 * 1024)
+
+#define NVKMD_NVRM_DEFAULT_MAX_PAGE_B (2u << 20)
 
 static bool
 nvkmd_nvrm_bar1_enabled(void)
@@ -60,6 +63,62 @@ nvkmd_nvrm_bar1_has_room(struct nvkmd_nvrm_pdev *pdev, struct NvRmApi *rm,
    return avail_B >= size_B + NVKMD_NVRM_BAR1_RESERVE_B;
 }
 
+/* Largest GPU page size for video memory: NVK_NVRM_PAGES=4k, 64k or 2m. */
+static uint32_t
+nvkmd_nvrm_max_page_size(void)
+{
+   static uint32_t max_B = 0;
+   if (max_B == 0) {
+      const char *env = getenv("NVK_NVRM_PAGES");
+      uint32_t v = NVKMD_NVRM_DEFAULT_MAX_PAGE_B;
+      if (env != NULL) {
+         if (strcmp(env, "4k") == 0)
+            v = 4096;
+         else if (strcmp(env, "64k") == 0)
+            v = 64u << 10;
+         else if (strcmp(env, "2m") == 0)
+            v = 2u << 20;
+      }
+      p_atomic_set(&max_B, v);
+   }
+   return max_B;
+}
+
+/* Every page is a TLB entry, and with 4 KiB pages a 4K render target takes
+ * 8,100 of them (airos-works/haiku#132). Video memory of 64 KiB or more gets
+ * big (64 KiB) pages and from 2 MiB huge (2 MiB) pages, unless rounding up
+ * to a whole huge page would waste more than an eighth.
+ */
+static uint32_t
+nvkmd_nvrm_vidmem_page_size(uint64_t size_B)
+{
+   const uint32_t max_B = nvkmd_nvrm_max_page_size();
+   const uint64_t huge_B = 2u << 20;
+   if (max_B >= huge_B && size_B >= huge_B &&
+       align64(size_B, huge_B) - size_B <= size_B / 8)
+      return huge_B;
+   if (max_B >= (64u << 10) && size_B >= (64u << 10))
+      return 64u << 10;
+   return 4096;
+}
+
+static NvU32
+nvkmd_nvrm_page_size_attr(uint32_t pageSize_B)
+{
+   switch (pageSize_B) {
+   case 64u << 10: return DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG);
+   case 2u << 20:  return DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _HUGE);
+   default:        return DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _4KB);
+   }
+}
+
+static NvU32
+nvkmd_nvrm_page_size_attr2(uint32_t pageSize_B)
+{
+   return pageSize_B == (2u << 20) ?
+      DRF_DEF(OS32, _ATTR2, _PAGE_SIZE_HUGE, _2MB) : 0;
+}
+
 static VkResult
 create_mem_or_close_bo(struct nvkmd_nvrm_dev *dev,
                        struct vk_object_base *log_obj,
@@ -67,6 +126,7 @@ create_mem_or_close_bo(struct nvkmd_nvrm_dev *dev,
                        NvHandle hMemoryPhys, uint64_t size_B,
                        enum nvkmd_va_flags va_flags,
                        uint8_t pte_kind, uint64_t va_align_B,
+                       uint32_t pageSize_B,
                        struct nvkmd_mem **mem_out)
 {
    struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
@@ -81,16 +141,19 @@ create_mem_or_close_bo(struct nvkmd_nvrm_dev *dev,
       goto fail_bo;
    }
 
+   /* Binds stay possible at any 4 KiB boundary whatever the page size:
+    * nvkmd_nvrm_va.c maps an unaligned one with smaller pages. */
    nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_nvrm_mem_ops,
                   mem_flags, size_B, dev->base.pdev->bind_align_B);
    mem->hMemoryPhys = hMemoryPhys;
    mem->isSystemMem = (mem_flags & NVKMD_MEM_GART) != 0;
+   mem->pageSize_B = pageSize_B;
 
-   result = nvkmd_dev_alloc_va(&dev->base, log_obj,
-                               va_flags, pte_kind,
-                               size_B, va_align_B,
-                               0 /* fixed_addr */,
-                               &mem->base.va);
+   result = nvkmd_nvrm_alloc_va_paged(&dev->base, log_obj,
+                                      va_flags, pte_kind,
+                                      size_B, MAX2(va_align_B, pageSize_B),
+                                      0 /* fixed_addr */, pageSize_B,
+                                      &mem->base.va);
    if (result != VK_SUCCESS)
       goto fail_mem;
 
@@ -180,13 +243,20 @@ nvkmd_nvrm_alloc_tiled_mem(struct nvkmd_dev *_dev,
 		NV01_MEMORY_SYSTEM :
 		NV01_MEMORY_LOCAL_USER;
 
+	/* RM refuses big pages in system memory that is not contiguous. */
+	uint32_t pageSize_B = isSystemMem ? 4096 :
+		nvkmd_nvrm_vidmem_page_size(size_B);
+	const uint64_t asked_size_B = size_B;
+	size_B = align64(size_B, pageSize_B);
+
 	NV_MEMORY_ALLOCATION_PARAMS params = {
 		.owner = pdev->hClient,
 		.type = NVOS32_TYPE_IMAGE,
 		.flags = (align_B != 0) ? NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE : 0,
-		.attr = DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _4KB),
+		.attr = nvkmd_nvrm_page_size_attr(pageSize_B),
+		.attr2 = nvkmd_nvrm_page_size_attr2(pageSize_B),
 		.size = size_B,
-		.alignment = align_B,
+		.alignment = MAX2(align_B, pageSize_B),
 	};
 	if (isSystemMem) {
 		params.attr |= DRF_DEF(OS32, _ATTR, _LOCATION, _PCI);
@@ -200,18 +270,41 @@ nvkmd_nvrm_alloc_tiled_mem(struct nvkmd_dev *_dev,
 		params.flags |= NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
 	}
 
+	/* RM writes back into the parameters, so a retry starts from a copy. */
+	const NV_MEMORY_ALLOCATION_PARAMS params0 = params;
 	NvHandle hMemoryPhys = 0;
    NV_STATUS nvRes = nvRmApiAlloc(&rm, pdev->hDevice, &hMemoryPhys, hClass, &params);
+   while (nvRes != NV_OK && pageSize_B > 4096) {
+      /* No free run of whole big or huge pages: smaller pages may fit. */
+      pageSize_B = pageSize_B > (64u << 10) && asked_size_B >= (64u << 10) ?
+                   64u << 10 : 4096;
+      size_B = align64(asked_size_B, pageSize_B);
+      params = params0;
+      params.attr = (params.attr & ~DRF_SHIFTMASK(NVOS32_ATTR_PAGE_SIZE)) |
+                    nvkmd_nvrm_page_size_attr(pageSize_B);
+      params.attr2 = (params.attr2 & ~DRF_SHIFTMASK(NVOS32_ATTR2_PAGE_SIZE_HUGE)) |
+                     nvkmd_nvrm_page_size_attr2(pageSize_B);
+      params.size = size_B;
+      params.alignment = MAX2(align_B, pageSize_B);
+      hMemoryPhys = 0;
+      nvRes = nvRmApiAlloc(&rm, pdev->hDevice, &hMemoryPhys, hClass, &params);
+   }
    if (nvRes != NV_OK && bar1) {
       /* Video memory is full: system memory still works, only slower. */
       flags &= ~(NVKMD_MEM_LOCAL | NVKMD_MEM_VRAM);
       flags |= NVKMD_MEM_GART;
       isSystemMem = true;
       hClass = NV01_MEMORY_SYSTEM;
+      params = params0;
       params.attr = DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _4KB) |
                     DRF_DEF(OS32, _ATTR, _LOCATION, _PCI) |
                     DRF_DEF(OS32, _ATTR, _COHERENCY, _CACHED);
+      params.attr2 = 0;
       params.flags &= ~NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
+      size_B = asked_size_B;
+      params.size = size_B;
+      params.alignment = align_B;
+      pageSize_B = 4096;
       hMemoryPhys = 0;
       nvRes = nvRmApiAlloc(&rm, pdev->hDevice, &hMemoryPhys, hClass, &params);
    }
@@ -221,7 +314,7 @@ nvkmd_nvrm_alloc_tiled_mem(struct nvkmd_dev *_dev,
    }
 
    return create_mem_or_close_bo(dev, log_obj, flags, hMemoryPhys, size_B,
-                                 va_flags, pte_kind, va_align_B,
+                                 va_flags, pte_kind, va_align_B, pageSize_B,
                                  mem_out);
 }
 
@@ -262,7 +355,7 @@ nvkmd_nvrm_import_host_ptr(struct nvkmd_dev *_dev,
 
    return create_mem_or_close_bo(dev, log_obj, NVKMD_MEM_GART, hMemory,
                                  aligned_size_B, NVKMD_VA_GART, 0,
-                                 NVKMD_NVRM_HOST_PTR_ALIGNMENT, mem_out);
+                                 NVKMD_NVRM_HOST_PTR_ALIGNMENT, 4096, mem_out);
 }
 
 // Take hold of the screen's frame buffer, which the accelerant publishes
@@ -301,7 +394,9 @@ nvkmd_nvrm_import_scanout(struct nvkmd_dev *_dev,
    /* A pitch surface, so the default (pitch) page kind is right. */
    return create_mem_or_close_bo(dev, log_obj, NVKMD_MEM_LOCAL, hMemory,
                                  info.size, NVKMD_VA_GART, 0 /* pte_kind */,
-                                 0 /* va_align_B */, mem_out);
+                                 0 /* va_align_B */,
+                                 4096 /* bound whole: RM's page size */,
+                                 mem_out);
 }
 
 VkResult

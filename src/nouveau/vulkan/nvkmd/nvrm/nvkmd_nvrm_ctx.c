@@ -605,9 +605,10 @@ nvkmd_nvrm_bind_ctx_bind(struct nvkmd_ctx *_ctx,
       const struct nvkmd_ctx_bind *bind = &binds[i];
       VkResult result;
       if (bind->op == NVKMD_BIND_OP_BIND) {
-         result = nvkmd_va_bind_mem(bind->va, log_obj, bind->va_offset_B,
-                                    bind->mem, bind->mem_offset_B,
-                                    bind->range_B);
+         result = nvkmd_nvrm_va_bind_mem_small(bind->va, log_obj,
+                                               bind->va_offset_B, bind->mem,
+                                               bind->mem_offset_B,
+                                               bind->range_B);
       } else {
          result = nvkmd_va_unbind(bind->va, log_obj, bind->va_offset_B,
                                   bind->range_B);

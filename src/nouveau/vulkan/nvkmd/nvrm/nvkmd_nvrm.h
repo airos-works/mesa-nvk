@@ -77,6 +77,10 @@ struct nvkmd_nvrm_mem {
    struct nvkmd_mem base;
    NvHandle hMemoryPhys;
    bool isSystemMem;
+   /* GPU page size RM allocated the memory with: 4 KiB, 64 KiB (big) or
+    * 2 MiB (huge). A bind that is not aligned to it is mapped with smaller
+    * pages (nvkmd_nvrm_va.c). */
+   uint32_t pageSize_B;
 };
 
 NVKMD_DECL_SUBCLASS(mem, nvrm);
@@ -134,6 +138,23 @@ VkResult nvkmd_nvrm_alloc_va(struct nvkmd_dev *dev,
                                 enum nvkmd_va_flags flags, uint8_t pte_kind,
                                 uint64_t size_B, uint64_t align_B,
                                 uint64_t fixed_addr, struct nvkmd_va **va_out);
+
+/* nvkmd_nvrm_alloc_va() for memory of the given GPU page size */
+VkResult nvkmd_nvrm_alloc_va_paged(struct nvkmd_dev *dev,
+                                   struct vk_object_base *log_obj,
+                                   enum nvkmd_va_flags flags, uint8_t pte_kind,
+                                   uint64_t size_B, uint64_t align_B,
+                                   uint64_t fixed_addr, uint32_t pageSize_B,
+                                   struct nvkmd_va **va_out);
+
+/* Binds for vkQueueBindSparse: always small pages, so that any 4 KiB piece
+ * can be unbound or rebound later without splitting a big page. */
+VkResult nvkmd_nvrm_va_bind_mem_small(struct nvkmd_va *va,
+                                      struct vk_object_base *log_obj,
+                                      uint64_t va_offset_B,
+                                      struct nvkmd_mem *mem,
+                                      uint64_t mem_offset_B,
+                                      uint64_t range_B);
 
 struct nvkmd_nvrm_exec_ctx {
    struct nvkmd_ctx base;

@@ -12,6 +12,8 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "class/cl50a0.h" // NV50_MEMORY_VIRTUAL
 
@@ -22,6 +24,22 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
                        enum nvkmd_va_flags flags, uint8_t pte_kind,
                        uint64_t size_B, uint64_t align_B,
                        uint64_t fixed_addr, struct nvkmd_va **va_out)
+{
+   return nvkmd_nvrm_alloc_va_paged(_dev, log_obj, flags, pte_kind, size_B,
+                                    align_B, fixed_addr, 0, va_out);
+}
+
+/* pageSize_B is the page size of the memory the range is made for, so that
+ * the range is aligned for it; 0 leaves the range to RM's default. The page
+ * size of each mapping comes from the memory and the bind (va_bind_mem()).
+ */
+VkResult
+nvkmd_nvrm_alloc_va_paged(struct nvkmd_dev *_dev,
+                          struct vk_object_base *log_obj,
+                          enum nvkmd_va_flags flags, uint8_t pte_kind,
+                          uint64_t size_B, uint64_t align_B,
+                          uint64_t fixed_addr, uint32_t pageSize_B,
+                          struct nvkmd_va **va_out)
 {
    struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(_dev);
    struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
@@ -35,7 +53,7 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
    if (va == NULL)
       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   const uint32_t min_align_B = _dev->pdev->bind_align_B;
+   const uint32_t min_align_B = MAX2(_dev->pdev->bind_align_B, pageSize_B);
    size_B = align64(size_B, min_align_B);
 
    assert(util_is_power_of_two_or_zero64(align_B));
@@ -66,6 +84,12 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
 	 * the range at once, and again wherever a part of it is unmapped. */
 	if (flags & NVKMD_VA_SPARSE)
 		params.flags |= NVOS32_ALLOC_FLAGS_SPARSE;
+	if (pageSize_B == (64u << 10)) {
+		params.attr |= DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG);
+	} else if (pageSize_B == (2u << 20)) {
+		params.attr |= DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _HUGE);
+		params.attr2 |= DRF_DEF(OS32, _ATTR2, _PAGE_SIZE_HUGE, _2MB);
+	}
 	/* Resman derives the page kind of a virtual allocation from these
 	 * attributes, so they have to describe exactly the kind NIL picked for the
 	 * image.  The kind numbering changed with Turing, hence the two tables. */
@@ -212,6 +236,19 @@ nvkmd_nvrm_va_free(struct nvkmd_va *_va)
    FREE(va);
 }
 
+/* NVK_NVRM_BIND_PAGES=rm passes every bind to RM with its default page size
+ * (the memory's), which is what nvkmd did before; only for experiments. */
+static bool
+bind_pages_rm(void)
+{
+   static int rm = -1;
+   if (rm < 0) {
+      const char *env = getenv("NVK_NVRM_BIND_PAGES");
+      p_atomic_set(&rm, env != NULL && strcmp(env, "rm") == 0);
+   }
+   return rm;
+}
+
 /* Unmaps [va_offset_B, va_offset_B + range_B) of whatever is bound there; RM
  * splits a mapping that is unmapped in part. Called with va->mutex held. */
 static VkResult
@@ -264,12 +301,9 @@ va_unbind_locked(struct nvkmd_nvrm_va *va, struct NvRmApi *rm,
 }
 
 static VkResult
-nvkmd_nvrm_va_bind_mem(struct nvkmd_va *_va,
-                          struct vk_object_base *log_obj,
-                          uint64_t va_offset_B,
-                          struct nvkmd_mem *_mem,
-                          uint64_t mem_offset_B,
-                          uint64_t range_B)
+va_bind_mem(struct nvkmd_va *_va, struct vk_object_base *log_obj,
+            uint64_t va_offset_B, struct nvkmd_mem *_mem,
+            uint64_t mem_offset_B, uint64_t range_B, bool small_pages)
 {
    struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(_va->dev);
    struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
@@ -287,7 +321,19 @@ nvkmd_nvrm_va_bind_mem(struct nvkmd_va *_va,
       gpuMapFlags |= DRF_DEF(OS46, _FLAGS, _CACHE_SNOOP, _DISABLE);
    }
 
+   /* RM maps with the memory's page size unless told otherwise. A bind whose
+    * GPU address, memory offset or size is not a multiple of it would be
+    * mapped from the start of the big page that holds it, so such a bind
+    * gets the largest page size it is aligned to (airos-works/haiku#132).
+    */
    const uint64_t va_addr = va->base.addr + va_offset_B;
+   const uint64_t misalign = va_addr | mem_offset_B | range_B;
+   if (mem->pageSize_B > 4096 && !bind_pages_rm()) {
+      if (small_pages || (misalign & ((64u << 10) - 1)) != 0)
+         gpuMapFlags |= DRF_DEF(OS46, _FLAGS, _PAGE_SIZE, _4KB);
+      else if ((misalign & (mem->pageSize_B - 1)) != 0)
+         gpuMapFlags |= DRF_DEF(OS46, _FLAGS, _PAGE_SIZE, _BIG);
+   }
 
    simple_mtx_lock(&va->mutex);
 
@@ -300,9 +346,9 @@ nvkmd_nvrm_va_bind_mem(struct nvkmd_va *_va,
    NvU64 dmaOffset = va_offset_B;
    NV_STATUS nvRes = nvRmApiMapMemoryDma(&rm, pdev->hDevice, va->hMemoryVirt, mem->hMemoryPhys, mem_offset_B, range_B, gpuMapFlags, &dmaOffset);
    if (nvRes != NV_OK) {
-      fprintf(stderr, "[!] nvRes: %#x (VA bind: va %#" PRIx64 "+%#" PRIx64 " mem off %#" PRIx64 " range %#" PRIx64 " sysmem %d)\n",
+      fprintf(stderr, "[!] nvRes: %#x (VA bind: va %#" PRIx64 "+%#" PRIx64 " mem off %#" PRIx64 " range %#" PRIx64 " sysmem %d page %#x flags %#x)\n",
               nvRes, va->base.addr, va_offset_B, mem_offset_B, range_B,
-              mem->isSystemMem);
+              mem->isSystemMem, mem->pageSize_B, gpuMapFlags);
       result = VK_ERROR_UNKNOWN;
       goto out;
    }
@@ -322,6 +368,30 @@ nvkmd_nvrm_va_bind_mem(struct nvkmd_va *_va,
 out:
    simple_mtx_unlock(&va->mutex);
    return result;
+}
+
+static VkResult
+nvkmd_nvrm_va_bind_mem(struct nvkmd_va *va,
+                          struct vk_object_base *log_obj,
+                          uint64_t va_offset_B,
+                          struct nvkmd_mem *mem,
+                          uint64_t mem_offset_B,
+                          uint64_t range_B)
+{
+   return va_bind_mem(va, log_obj, va_offset_B, mem, mem_offset_B, range_B,
+                      false);
+}
+
+VkResult
+nvkmd_nvrm_va_bind_mem_small(struct nvkmd_va *va,
+                             struct vk_object_base *log_obj,
+                             uint64_t va_offset_B,
+                             struct nvkmd_mem *mem,
+                             uint64_t mem_offset_B,
+                             uint64_t range_B)
+{
+   return va_bind_mem(va, log_obj, va_offset_B, mem, mem_offset_B, range_B,
+                      true);
 }
 
 static VkResult
