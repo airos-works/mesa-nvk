@@ -48,6 +48,8 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
    va->base.flags = flags;
    va->base.pte_kind = pte_kind;
    va->base.size_B = size_B;
+   simple_mtx_init(&va->mutex, mtx_plain);
+   util_dynarray_init(&va->bindings, NULL);
 
 	NvHandle hMemoryVirt = 0;
 	NV_MEMORY_ALLOCATION_PARAMS params = {
@@ -60,6 +62,10 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
 		.alignment = align_B,
 		.hVASpace = pdev->hVaSpace,
 	};
+	/* The unbound pages of a sparse resource read as zero: RM sparsifies
+	 * the range at once, and again wherever a part of it is unmapped. */
+	if (flags & NVKMD_VA_SPARSE)
+		params.flags |= NVOS32_ALLOC_FLAGS_SPARSE;
 	/* Resman derives the page kind of a virtual allocation from these
 	 * attributes, so they have to describe exactly the kind NIL picked for the
 	 * image.  The kind numbering changed with Turing, hence the two tables. */
@@ -198,9 +204,63 @@ nvkmd_nvrm_va_free(struct nvkmd_va *_va)
    struct NvRmApi rm;
    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
 
+   /* Freeing the range unmaps whatever is still bound in it. */
    nvRmApiFree(&rm, va->hMemoryVirt);
 
+   util_dynarray_fini(&va->bindings);
+   simple_mtx_destroy(&va->mutex);
    FREE(va);
+}
+
+/* Unmaps [va_offset_B, va_offset_B + range_B) of whatever is bound there; RM
+ * splits a mapping that is unmapped in part. Called with va->mutex held. */
+static VkResult
+va_unbind_locked(struct nvkmd_nvrm_va *va, struct NvRmApi *rm,
+                 NvHandle hDevice, uint64_t va_offset_B, uint64_t range_B)
+{
+   const uint64_t end_B = va_offset_B + range_B;
+   VkResult result = VK_SUCCESS;
+
+   unsigned i = 0;
+   while (i < util_dynarray_num_elements(&va->bindings,
+                                         struct nvkmd_nvrm_va_binding)) {
+      struct nvkmd_nvrm_va_binding *b =
+         util_dynarray_element(&va->bindings, struct nvkmd_nvrm_va_binding, i);
+      const uint64_t b_end_B = b->va_offset_B + b->range_B;
+      if (b_end_B <= va_offset_B || b->va_offset_B >= end_B) {
+         i++;
+         continue;
+      }
+
+      const uint64_t lo_B = MAX2(b->va_offset_B, va_offset_B);
+      const uint64_t hi_B = MIN2(b_end_B, end_B);
+      NV_STATUS nvRes = nvRmApiUnmapMemoryDma(rm, hDevice, va->hMemoryVirt,
+                                              b->hMemoryPhys, 0,
+                                              va->base.addr + lo_B,
+                                              hi_B - lo_B);
+      if (nvRes != NV_OK) {
+         fprintf(stderr, "[!] nvRes: %#x (VA unbind: va %#" PRIx64 "+%#" PRIx64 " range %#" PRIx64 ")\n",
+                 nvRes, va->base.addr, lo_B, hi_B - lo_B);
+         result = VK_ERROR_UNKNOWN;
+      }
+
+      struct nvkmd_nvrm_va_binding left = *b, right = *b;
+      left.range_B = lo_B - b->va_offset_B;
+      right.va_offset_B = hi_B;
+      right.range_B = b_end_B - hi_B;
+
+      /* Replace the entry with the last one, then add what is left of it
+       * on either side; those lie outside the range, so looking at them
+       * again does nothing. */
+      *b = util_dynarray_top(&va->bindings, struct nvkmd_nvrm_va_binding);
+      (void)util_dynarray_pop(&va->bindings, struct nvkmd_nvrm_va_binding);
+      if (left.range_B > 0)
+         util_dynarray_append(&va->bindings, struct nvkmd_nvrm_va_binding, left);
+      if (right.range_B > 0)
+         util_dynarray_append(&va->bindings, struct nvkmd_nvrm_va_binding, right);
+   }
+
+   return result;
 }
 
 static VkResult
@@ -226,20 +286,42 @@ nvkmd_nvrm_va_bind_mem(struct nvkmd_va *_va,
    } else {
       gpuMapFlags |= DRF_DEF(OS46, _FLAGS, _CACHE_SNOOP, _DISABLE);
    }
+
+   const uint64_t va_addr = va->base.addr + va_offset_B;
+
+   simple_mtx_lock(&va->mutex);
+
+   /* A bind replaces whatever was bound there. */
+   VkResult result = va_unbind_locked(va, &rm, pdev->hDevice, va_offset_B,
+                                      range_B);
+   if (result != VK_SUCCESS)
+      goto out;
+
    NvU64 dmaOffset = va_offset_B;
    NV_STATUS nvRes = nvRmApiMapMemoryDma(&rm, pdev->hDevice, va->hMemoryVirt, mem->hMemoryPhys, mem_offset_B, range_B, gpuMapFlags, &dmaOffset);
    if (nvRes != NV_OK) {
-      fprintf(stderr, "[!] nvRes: %#x (VA bind: va %#" PRIx64 "+%#" PRIx64 " mem off %#" PRIx64 " range %#" PRIx64 " sysmem %d)\n", nvRes, va->base.addr, va_offset_B, mem_offset_B, range_B, mem->isSystemMem);
-      return VK_ERROR_UNKNOWN;
-   }
-   if (dmaOffset != va->base.addr + va_offset_B) {
-      fprintf(stderr, "[!] mapped at %#"PRIx64", expected %#"PRIx64"\n",
-         (uint64_t)dmaOffset, va->base.addr + va_offset_B);
+      fprintf(stderr, "[!] nvRes: %#x (VA bind: va %#" PRIx64 "+%#" PRIx64 " mem off %#" PRIx64 " range %#" PRIx64 " sysmem %d)\n",
+              nvRes, va->base.addr, va_offset_B, mem_offset_B, range_B,
+              mem->isSystemMem);
+      result = VK_ERROR_UNKNOWN;
+      goto out;
    }
 
-   va->hMemoryPhys = mem->hMemoryPhys;
+   struct nvkmd_nvrm_va_binding binding = {
+      .va_offset_B = va_offset_B,
+      .range_B = range_B,
+      .hMemoryPhys = mem->hMemoryPhys,
+   };
+   util_dynarray_append(&va->bindings, struct nvkmd_nvrm_va_binding, binding);
 
-   return VK_SUCCESS;
+   if (dmaOffset != va_addr) {
+      fprintf(stderr, "[!] mapped at %#" PRIx64 ", expected %#" PRIx64 "\n",
+              (uint64_t)dmaOffset, va_addr);
+   }
+
+out:
+   simple_mtx_unlock(&va->mutex);
+   return result;
 }
 
 static VkResult
@@ -255,13 +337,11 @@ nvkmd_nvrm_va_unbind(struct nvkmd_va *_va,
    struct NvRmApi rm;
    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
 
-   NV_STATUS nvRes = nvRmApiUnmapMemoryDma(&rm, pdev->hDevice, va->hMemoryVirt, va->hMemoryPhys, 0, va_offset_B);
-   if (nvRes != NV_OK)
-      return VK_ERROR_UNKNOWN;
-
-   va->hMemoryPhys = 0;
-
-   return VK_SUCCESS;
+   simple_mtx_lock(&va->mutex);
+   VkResult result = va_unbind_locked(va, &rm, pdev->hDevice, va_offset_B,
+                                      range_B);
+   simple_mtx_unlock(&va->mutex);
+   return result;
 }
 
 const struct nvkmd_va_ops nvkmd_nvrm_va_ops = {

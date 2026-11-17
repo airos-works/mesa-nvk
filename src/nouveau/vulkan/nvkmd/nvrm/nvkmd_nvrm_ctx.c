@@ -597,7 +597,24 @@ nvkmd_nvrm_bind_ctx_bind(struct nvkmd_ctx *_ctx,
                             uint32_t bind_count,
                             const struct nvkmd_ctx_bind *binds)
 {
-   struct nvkmd_nvrm_bind_ctx *ctx = nvkmd_nvrm_bind_ctx(_ctx);
+   /* vkQueueBindSparse. RM updates the page tables at once (the waits are
+    * done first, on the processor), so each bind takes effect in order.
+    * These binds used to be dropped: a sparse resource had no memory at all.
+    */
+   for (uint32_t i = 0; i < bind_count; i++) {
+      const struct nvkmd_ctx_bind *bind = &binds[i];
+      VkResult result;
+      if (bind->op == NVKMD_BIND_OP_BIND) {
+         result = nvkmd_va_bind_mem(bind->va, log_obj, bind->va_offset_B,
+                                    bind->mem, bind->mem_offset_B,
+                                    bind->range_B);
+      } else {
+         result = nvkmd_va_unbind(bind->va, log_obj, bind->va_offset_B,
+                                  bind->range_B);
+      }
+      if (result != VK_SUCCESS)
+         return result;
+   }
 
    return VK_SUCCESS;
 }

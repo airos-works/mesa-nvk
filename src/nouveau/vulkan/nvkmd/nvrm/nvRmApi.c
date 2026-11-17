@@ -163,7 +163,7 @@ NvU32 nvRmApiMapMemoryDma(NvRmApi *api, NvU32 hDevice, NvU32 hDma, NvU32 hMemory
 	return p.status;
 }
 
-NvU32 nvRmApiUnmapMemoryDma(NvRmApi *api, NvU32 hDevice, NvU32 hDma, NvU32 hMemory, NvU32 flags, NvU64 dmaOffset)
+NvU32 nvRmApiUnmapMemoryDma(NvRmApi *api, NvU32 hDevice, NvU32 hDma, NvU32 hMemory, NvU32 flags, NvU64 dmaOffset, NvU64 size)
 {
 	NVOS47_PARAMETERS p = {
 		.hClient = api->hClient,
@@ -171,7 +171,8 @@ NvU32 nvRmApiUnmapMemoryDma(NvRmApi *api, NvU32 hDevice, NvU32 hDma, NvU32 hMemo
 		.hDma = hDma,
 		.hMemory = hMemory,
 		.flags = flags,
-		.dmaOffset = dmaOffset
+		.dmaOffset = dmaOffset,
+		.size = size, /* 0: the whole mapping */
 	};
 	int ret = nvRmIoctl(api->fd, NV_ESC_RM_UNMAP_MEMORY_DMA, &p, sizeof(p));
 	if (ret < 0) {

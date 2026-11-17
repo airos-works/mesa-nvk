@@ -110,10 +110,21 @@ VkResult nvkmd_nvrm_import_dma_buf(struct nvkmd_dev *dev,
                                       struct vk_object_base *log_obj,
                                       int fd, struct nvkmd_mem **mem_out);
 
+/* One memory range bound into a VA range: RM's unmap call names the memory
+ * and the mapping, so an unbind has to know what each part of the range holds.
+ */
+struct nvkmd_nvrm_va_binding {
+   uint64_t va_offset_B;
+   uint64_t range_B;
+   NvHandle hMemoryPhys;
+};
+
 struct nvkmd_nvrm_va {
    struct nvkmd_va base;
-   NvHandle hMemoryPhys;
    NvHandle hMemoryVirt;
+   simple_mtx_t mutex;
+   /* struct nvkmd_nvrm_va_binding, in no particular order */
+   struct util_dynarray bindings;
 };
 
 NVKMD_DECL_SUBCLASS(va, nvrm);
